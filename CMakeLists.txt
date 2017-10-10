@@ -21,6 +21,7 @@ find_package(catkin COMPONENTS
         ${MSG_DEPS}
         dynamic_reconfigure
         cmake_modules
+        pyride_common_msgs
         REQUIRED)
 
 find_package(Eigen REQUIRED)
