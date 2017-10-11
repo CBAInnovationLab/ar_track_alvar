@@ -44,6 +44,7 @@
 #include <tf/transform_listener.h>
 #include <sensor_msgs/image_encodings.h>
 #include <pyride_common_msgs/NodeStatus.h>
+#include <pyride_common_msgs/NodeMessage.h>
 #include <dynamic_reconfigure/server.h>
 #include <ar_track_alvar/ParamsConfig.h>
 
@@ -57,16 +58,17 @@ image_transport::Subscriber cam_sub_;
 ros::Publisher arMarkerPub_;
 ros::Publisher rvizMarkerPub_;
 ros::Publisher pyridePub_;
+ros::Subscriber pyrideSub_;
 ar_track_alvar::AlvarMarkers arPoseMarkers_;
 visualization_msgs::Marker rvizMarker_;
 tf::TransformListener *tf_listener;
 tf::TransformBroadcaster *tf_broadcaster;
 MarkerDetector<MarkerData> marker_detector;
+image_transport::ImageTransport * it_ = NULL;
 
 unsigned int detected_markers = 0; // maximum 32 markers
 
-bool enableSwitched = false;
-bool enabled = true;
+bool enabled = false;
 double max_frequency;
 double marker_size;
 double max_new_marker_error;
@@ -84,11 +86,11 @@ void showbits(unsigned int x)
   printf("\n");
 }
 
-void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
+void getCapCallback(const sensor_msgs::ImageConstPtr & image_msg)
 {
 	//If we've already gotten the cam info, then go ahead
-	if(cam->getCamInfo_){
-		try{
+	if (cam->getCamInfo_) {
+		try {
 			tf::StampedTransform CamToOutput;
       try{
         tf_listener->waitForTransform(output_frame, image_msg->header.frame_id, image_msg->header.stamp, ros::Duration(1.0));
@@ -243,18 +245,54 @@ void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
 	}
 }
 
+void enableService()
+{
+  if (enabled || !it_)
+    return;
+
+  ROS_INFO("Subscribing to image topic");
+  cam_sub_ = it_->subscribe(cam_image_topic, 1, &getCapCallback);
+  enabled = true;
+}
+
+void disableService()
+{
+  if (!enabled)
+    return;
+
+  ROS_INFO("Stop subscribing to image topic");
+  cam_sub_.shutdown();
+  enabled = false;
+}
+
 void configCallback(ar_track_alvar::ParamsConfig &config, uint32_t level)
 {
   ROS_INFO("AR tracker reconfigured: %s %.2f %.2f %.2f %.2f", config.enabled ? "ENABLED" : "DISABLED",
            config.max_frequency, config.marker_size, config.max_new_marker_error, config.max_track_error);
 
-  enableSwitched = enabled != config.enabled;
+  if (config.enabled) {
+    enableService();
+  }
+  else {
+    disableService();
+  }
 
-  enabled = config.enabled;
   max_frequency = config.max_frequency;
   marker_size = config.marker_size;
   max_new_marker_error = config.max_new_marker_error;
   max_track_error = config.max_track_error;
+}
+
+void nodeMessageCallBack( const pyride_common_msgs::NodeMessageConstPtr & msg )
+{
+  if (msg->node_id.compare( "ar_track_alvar" ) == 0) {
+    if (msg->command.compare( "enable" ) == 0) {
+      enableService();
+    }
+    else if (msg->command.compare( "disable" ) == 0) {
+      disableService();
+    }
+  }
 }
 
 int main(int argc, char *argv[])
@@ -262,7 +300,7 @@ int main(int argc, char *argv[])
 	ros::init (argc, argv, "marker_detect");
 	ros::NodeHandle n, pn("~");
 	
-	if(argc < 7){
+	if (argc < 7){
 		std::cout << std::endl;
 		cout << "Not enough arguments provided." << endl;
 		cout << "Usage: ./individualMarkersNoKinect <marker size in cm> <max new marker error> "
@@ -297,6 +335,7 @@ int main(int argc, char *argv[])
 	arMarkerPub_ = n.advertise < ar_track_alvar::AlvarMarkers > ("ar_pose_marker", 0);
 	rvizMarkerPub_ = n.advertise < visualization_msgs::Marker > ("visualization_marker", 0);
   pyridePub_ = n.advertise<pyride_common_msgs::NodeStatus>( "/pyride/node_status", 1 );
+  pyrideSub_ = n.subscribe( "/pyride/node_message", 1, &nodeMessageCallBack );
 
   // Prepare dynamic reconfiguration
   dynamic_reconfigure::Server < ar_track_alvar::ParamsConfig > server;
@@ -309,42 +348,22 @@ int main(int argc, char *argv[])
   // It will also reconfigure parameters for the first time, setting the default values
 	ros::Duration(1.0).sleep();
 	ros::spinOnce();	
-	 
-	image_transport::ImageTransport it_(n);
 
-  if (enabled == true)
-  {
-    // This always happens, as enable is true by default
-    ROS_INFO("Subscribing to image topic");
-    	cam_sub_ = it_.subscribe (cam_image_topic, 1, &getCapCallback);
-  }
-
+	it_ = new image_transport::ImageTransport(n);
   // Run at the configured rate, discarding pointcloud msgs if necessary
   ros::Rate rate(max_frequency);
 
-  while (ros::ok())
-  {
+  while (ros::ok()) {
     ros::spinOnce();
     rate.sleep();
 
-    if (std::abs((rate.expectedCycleTime() - ros::Duration(1.0 / max_frequency)).toSec()) > 0.001)
-    {
+    if (std::abs((rate.expectedCycleTime() - ros::Duration(1.0 / max_frequency)).toSec()) > 0.001) {
       // Change rate dynamically; if must be above 0, as 0 will provoke a segfault on next spinOnce
       ROS_DEBUG("Changing frequency from %.2f to %.2f", 1.0 / rate.expectedCycleTime().toSec(), max_frequency);
       rate = ros::Rate(max_frequency);
     }
-
-    if (enableSwitched == true)
-    {
-      // Enable/disable switch: subscribe/unsubscribe to make use of pointcloud processing nodelet
-      // lazy publishing policy; in CPU-scarce computer as TurtleBot's laptop this is a huge saving
-      if (enabled == false)
-        cam_sub_.shutdown();
-      else
-        cam_sub_ = it_.subscribe(cam_image_topic, 1, &getCapCallback);
-      enableSwitched = false;
-    }
   }
-
-    return 0;
+  disableService();
+  delete it_;
+  return 0;
 }
