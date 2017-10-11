@@ -45,6 +45,7 @@
 #include <tf/transform_listener.h>
 #include <tf/transform_broadcaster.h>
 #include <sensor_msgs/image_encodings.h>
+#include <pyride_common_msgs/NodeStatus.h>
 #include <dynamic_reconfigure/server.h>
 #include <ar_track_alvar/ParamsConfig.h>
 
@@ -57,11 +58,14 @@ cv_bridge::CvImagePtr cv_ptr_;
 image_transport::Subscriber cam_sub_;
 ros::Publisher arMarkerPub_;
 ros::Publisher rvizMarkerPub_;
+ros::Publisher pyridePub_;
 ar_track_alvar_msgs::AlvarMarkers arPoseMarkers_;
 visualization_msgs::Marker rvizMarker_;
 tf::TransformListener *tf_listener;
 tf::TransformBroadcaster *tf_broadcaster;
 MarkerDetector<MarkerData> marker_detector;
+
+unsigned int detected_markers = 0; // maximum 32 markers
 
 bool enableSwitched = false;
 bool enabled = true;
@@ -74,9 +78,6 @@ std::string cam_info_topic;
 std::string output_frame;
 int marker_resolution = 5; // default marker resolution
 int marker_margin = 2; // default marker margin
-
-void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg);
-
 
 void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
 {
@@ -92,19 +93,20 @@ void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
       				ROS_ERROR("%s",ex.what());
     			}
 
+      //Convert the image
+      cv_ptr_ = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
 
-            //Convert the image
-            cv_ptr_ = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
+      //Get the estimated pose of the main markers by using all the markers in each bundle
 
-            //Get the estimated pose of the main markers by using all the markers in each bundle
+      // GetMultiMarkersPoses expects an IplImage*, but as of ros groovy, cv_bridge gives
+      // us a cv::Mat. I'm too lazy to change to cv::Mat throughout right now, so I
+      // do this conversion here -jbinney
+      IplImage ipl_image = cv_ptr_->image;
 
-            // GetMultiMarkersPoses expects an IplImage*, but as of ros groovy, cv_bridge gives
-            // us a cv::Mat. I'm too lazy to change to cv::Mat throughout right now, so I
-            // do this conversion here -jbinney
-            IplImage ipl_image = cv_ptr_->image;
+      marker_detector.Detect(&ipl_image, cam, true, false, max_new_marker_error, max_track_error, CVSEQ, true);
+      arPoseMarkers_.markers.clear ();
 
-            marker_detector.Detect(&ipl_image, cam, true, false, max_new_marker_error, max_track_error, CVSEQ, true);
-            arPoseMarkers_.markers.clear ();
+      unsigned int new_detection = 0;
 			for (size_t i=0; i<marker_detector.markers->size(); i++)
 			{
 				//Get the pose relative to the camera
@@ -118,20 +120,20 @@ void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
 				double qz = p.quaternion[3];
 				double qw = p.quaternion[0];
 
-                tf::Quaternion rotation (qx,qy,qz,qw);
-                tf::Vector3 origin (px,py,pz);
-                tf::Transform t (rotation, origin);
-                tf::Vector3 markerOrigin (0, 0, 0);
-                tf::Transform m (tf::Quaternion::getIdentity (), markerOrigin);
-                tf::Transform markerPose = t * m; // marker pose in the camera frame
+        tf::Quaternion rotation (qx,qy,qz,qw);
+        tf::Vector3 origin (px,py,pz);
+        tf::Transform t (rotation, origin);
+        tf::Vector3 markerOrigin (0, 0, 0);
+        tf::Transform m (tf::Quaternion::getIdentity (), markerOrigin);
+        tf::Transform markerPose = t * m; // marker pose in the camera frame
 
-                tf::Vector3 z_axis_cam = tf::Transform(rotation, tf::Vector3(0,0,0)) * tf::Vector3(0, 0, 1);
+        tf::Vector3 z_axis_cam = tf::Transform(rotation, tf::Vector3(0,0,0)) * tf::Vector3(0, 0, 1);
 //                ROS_INFO("%02i Z in cam frame: %f %f %f",id, z_axis_cam.x(), z_axis_cam.y(), z_axis_cam.z());
-                /// as we can't see through markers, this one is false positive detection
-                if (z_axis_cam.z() > 0)
-                {
-                    continue;
-                }
+        /// as we can't see through markers, this one is false positive detection
+        if (z_axis_cam.z() > 0)
+        {
+            continue;
+        }
 
 				//Publish the transform from the camera to the marker
 				std::string markerFrame = "ar_marker_";
@@ -206,12 +208,41 @@ void getCapCallback (const sensor_msgs::ImageConstPtr & image_msg)
 			    ar_pose_marker.header.stamp = image_msg->header.stamp;
 			    ar_pose_marker.id = id;
 			    arPoseMarkers_.markers.push_back (ar_pose_marker);
+
+			  new_detection |= (1<<id);
+        if (((1 << id) & detected_markers) == 0) { // the marker does not exist
+          detected_markers |= (1<<id);
+
+          pyride_common_msgs::NodeStatus msg;
+          msg.header.stamp = ros::Time::now();
+          msg.priority = 2;
+          msg.for_console = false;
+          msg.node_id = "ar_track_alvar";
+          msg.status_text = markerFrame + " on";
+          pyridePub_.publish( msg );
+        }
 			}
 			arMarkerPub_.publish (arPoseMarkers_);
+		  unsigned int deprecated_markers = (new_detection ^ detected_markers);
+		  for (int j = 0; j < sizeof(unsigned int); j++) {
+		    if (((1 << j) & deprecated_markers) > 0) {
+		      char markerFrame[200];
+		      snprintf( markerFrame, 200, "ar_marker_%d off", j );
+
+		      pyride_common_msgs::NodeStatus msg;
+		      msg.header.stamp = ros::Time::now();
+		      msg.priority = 2;
+		      msg.for_console = false;
+		      msg.node_id = "ar_track_alvar";
+		      msg.status_text = markerFrame;
+		      pyridePub_.publish( msg );
+		    }
+		  }
+		  detected_markers = new_detection;
 		}
-        catch (cv_bridge::Exception& e){
-      		ROS_ERROR ("Could not convert from '%s' to 'rgb8'.", image_msg->encoding.c_str ());
-    	}
+      catch (cv_bridge::Exception& e){
+        ROS_ERROR ("Could not convert from '%s' to 'rgb8'.", image_msg->encoding.c_str ());
+    }
 	}
 }
 
@@ -300,6 +331,7 @@ int main(int argc, char *argv[])
 	tf_broadcaster = new tf::TransformBroadcaster();
 	arMarkerPub_ = n.advertise < ar_track_alvar_msgs::AlvarMarkers > ("ar_pose_marker", 0);
 	rvizMarkerPub_ = n.advertise < visualization_msgs::Marker > ("visualization_marker", 0);
+	pyridePub_ = n.advertise<pyride_common_msgs::NodeStatus>( "/pyride/node_status", 1 );
 
   // Prepare dynamic reconfiguration
   dynamic_reconfigure::Server < ar_track_alvar::ParamsConfig > server;
