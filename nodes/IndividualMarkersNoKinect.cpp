@@ -251,6 +251,7 @@ void enableService()
     return;
 
   ROS_INFO("Subscribing to image topic");
+  detected_markers = 0;
   cam_sub_ = it_->subscribe(cam_image_topic, 1, &getCapCallback);
   enabled = true;
 }
